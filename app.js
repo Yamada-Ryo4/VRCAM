@@ -684,14 +684,16 @@ async function startUpload() {
                 const totalMB = fileGz.length / 1048576;
                 setProgress(pctBefore, `Part ${partNum}/${totalParts}: ${uploadedBefore.toFixed(1)}/${totalMB.toFixed(1)} MB`);
 
+                // Calculate Content-MD5 for this chunk (S3 requires it per X-Amz-SignedHeaders)
+                const chunkMd5 = md5(chunk);
+
                 const rPartPut = await fetch(`${API_BASE}/api/s3proxy`, {
                     method: 'PUT',
                     body: chunk,
                     headers: {
                         'X-S3-Url': partUrl,
                         'X-VRC-Auth': vrcAuth,
-                        // No X-S3-content-type — Worker reads X-Amz-SignedHeaders dynamically
-                        // x-amz-content-sha256 is auto-filled by worker if required
+                        'X-S3-content-md5': chunkMd5,
                     },
                 });
                 if (!rPartPut.ok) {
