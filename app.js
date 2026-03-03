@@ -977,9 +977,10 @@ async function startUpload() {
                     const rPS = await apiCall(`/api/vrc/file/${fileId}/${version2Id}/file/start?partNumber=${pn}`, { method: 'PUT' });
                     if (!rPS.ok) throw new Error(`Patched part ${pn} start failed`);
                     const pUrl = (await rPS.json()).url;
+                    const chunkMd5 = md5(chunk);
                     const rPP = await fetch(`${API_BASE}/api/s3proxy`, {
                         method: 'PUT', body: chunk,
-                        headers: { 'X-S3-Url': pUrl, 'X-VRC-Auth': vrcAuth }
+                        headers: { 'X-S3-Url': pUrl, 'X-S3-content-md5': chunkMd5, 'X-VRC-Auth': vrcAuth }
                     });
                     if (!rPP.ok) throw new Error(`Patched part ${pn} upload failed`);
                     const pj = await rPP.json();
