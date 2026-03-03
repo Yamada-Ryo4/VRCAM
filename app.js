@@ -239,7 +239,8 @@ async function downloadSelected() {
             const filename = `${safeName}_${av.id}.vrca`;
 
             // Use Worker download proxy: same-origin, so Content-Disposition/filename works correctly
-            const proxyUrl = `${API_BASE}/api/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}`;
+            // Auth passed as query param since <a>.click() can't send custom headers
+            const proxyUrl = `${API_BASE}/api/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}&auth=${encodeURIComponent(vrcAuth)}`;
             const a = document.createElement('a');
             a.href = proxyUrl;
             a.download = filename;

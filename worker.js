@@ -229,12 +229,18 @@ export default {
         if (path === "/api/download" && request.method === "GET") {
             const vrcUrl = url.searchParams.get("url");
             const filename = url.searchParams.get("filename") || "avatar.vrca";
+            // Auth passed as query param since <a>.click() cannot send custom headers
+            const authParam = url.searchParams.get("auth");
+            let downloadAuth = auth; // from X-VRC-Auth header (normal apiCall)
+            if (!downloadAuth && authParam) {
+                try { downloadAuth = atob(authParam); } catch { downloadAuth = authParam; }
+            }
             if (!vrcUrl) return jsonResp({ error: "Missing url param" }, 400);
 
             // Step 1: Resolve VRChat file URL → S3 CDN URL (follows one redirect with auth)
             const step1 = await fetch(vrcUrl, {
                 method: "GET",
-                headers: { "User-Agent": USER_AGENT, ...(auth ? { "Cookie": auth } : {}) },
+                headers: { "User-Agent": USER_AGENT, ...(downloadAuth ? { "Cookie": downloadAuth } : {}) },
                 redirect: "manual",
             });
 
