@@ -1003,11 +1003,22 @@ async function startUpload() {
                 }
 
                 // Update avatar assetUrl to patched version
+                const patchedAssetUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${version2Id}/file`;
                 const rUp = await apiCall(`/api/vrc/avatars/${avatarId}`, {
-                    method: 'PUT', json: { assetUrl: `https://api.vrchat.cloud/api/1/file/${fileId}/${version2Id}/file` }
+                    method: 'PUT', json: {
+                        assetUrl: patchedAssetUrl,
+                        name,
+                        imageUrl: finalImageUrl,
+                        unityVersion: '2022.3.22f1',
+                        platform: 'standalonewindows',
+                    }
                 });
-                if (!rUp.ok) logMsg('Warning: assetUrl update failed: ' + await rUp.text(), 'error');
-                else logMsg(`Avatar updated to patched version ${version2Id}`, 'success');
+                if (!rUp.ok) {
+                    const errText = await rUp.text();
+                    logMsg('assetUrl update failed: ' + errText, 'error');
+                    throw new Error('Failed to update avatar assetUrl: ' + errText);
+                }
+                logMsg(`Avatar updated to patched version ${version2Id}`, 'success');
             }
 
             setProgress(100, 'Done!');
