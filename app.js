@@ -707,23 +707,31 @@ async function startUpload() {
             }
 
             // 6. Finish file upload
+            // CRITICAL: Only include etags for multipart uploads (totalParts > 1).
+            // For simple uploads (1 part), VRChat uses S3 PutObject (not multipart).
+            // Sending etags triggers CompleteMultipartUpload which fails with 500 since
+            // there's no multipart session (uploadId is empty, category is "simple").
             setProgress(95, 'Finalizing...');
+            const finishBody = { nextPartNumber: '0', maxParts: '0' };
+            if (totalParts > 1) finishBody.etags = etags;
             const rFileFinish = await apiCall(`/api/vrc/file/${fileId}/${versionId}/file/finish`, {
-                method: 'PUT', json: { etags, nextPartNumber: '0', maxParts: '0' }
+                method: 'PUT', json: finishBody
             });
             if (!rFileFinish.ok) throw new Error('Failed to finalize file: ' + await rFileFinish.text());
 
             // 7. Wait for file status to become 'complete' before creating avatar
-            // GET /file/{fileId}/{versionId} returns the version object directly with a `.status` field
+            // Large files (100MB+) can take several minutes to process on VRChat's side
             setProgress(97, 'Waiting for file to be processed...');
             let fileReady = false;
-            for (let attempt = 0; attempt < 20; attempt++) {
-                await new Promise(r => setTimeout(r, 2000));
+            const maxAttempts = 60;  // 60 × 5s = 5 minutes max
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                await new Promise(r => setTimeout(r, 5000));
                 const rStatus = await apiCall(`/api/vrc/file/${fileId}/${versionId}`);
                 if (rStatus.ok) {
                     const ver = await rStatus.json();
                     const status = ver.status || 'unknown';
-                    logMsg(`Attempt ${attempt + 1}/20 — status: ${status}`, 'info');
+                    const elapsed = ((attempt + 1) * 5);
+                    logMsg(`Attempt ${attempt + 1}/${maxAttempts} (${elapsed}s) — status: ${status}`, 'info');
                     if (status === 'complete') {
                         fileReady = true;
                         break;
@@ -732,10 +740,10 @@ async function startUpload() {
                         throw new Error(`File processing failed with status: error`);
                     }
                 } else {
-                    logMsg(`Attempt ${attempt + 1}/20 — poll failed (${rStatus.status})`, 'info');
+                    logMsg(`Attempt ${attempt + 1}/${maxAttempts} — poll failed (${rStatus.status})`, 'info');
                 }
             }
-            if (!fileReady) throw new Error('File not ready after 40s. It may still be processing — wait a moment and try the Update mode instead of New.');
+            if (!fileReady) throw new Error('File not ready after 5 minutes. It may still be processing — wait and try Update mode.');
 
             // 8. Create/update avatar
             if (isNew) {
