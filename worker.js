@@ -300,48 +300,55 @@ export default {
             return jsonResp({ error: `VRChat returned ${resp.status}` }, resp.status);
         }
 
-        // POST /api/s3proxy — Proxy S3 uploads (bypass CORS)
-        // S3 presigned URLs require EXACT header matching per X-Amz-SignedHeaders.
-        // Dynamic mapping: for each signed header h, look for X-S3-{h} in our request headers.
+        // PUT /api/s3proxy — Proxy S3 uploads (bypass CORS)
+        // CRITICAL: CF Workers fetch() auto-adds "Content-Type: application/octet-stream" for ArrayBuffer body.
+        // If content-type is NOT in X-Amz-SignedHeaders, this extra header breaks S3 signature → 403.
+        // Fix: wrap body in Blob with empty type to suppress automatic Content-Type injection.
         if (path === "/api/s3proxy" && request.method === "PUT") {
             const s3Url = request.headers.get("X-S3-Url");
             if (!s3Url) return jsonResp({ error: "Missing X-S3-Url header" }, 400);
 
-            // Buffer body: prevents Transfer-Encoding:chunked which S3 presigned URLs reject
+            // Buffer body to avoid Transfer-Encoding:chunked
             const bodyBuffer = await request.arrayBuffer();
 
-            // Build headers dynamically from X-Amz-SignedHeaders in the presigned URL
+            // Parse X-Amz-SignedHeaders from presigned URL
             const s3Headers = new Headers();
+            let signedHeadersList = [];
             try {
                 const parsedUrl = new URL(s3Url);
                 const sh = parsedUrl.searchParams.get("X-Amz-SignedHeaders");
-                if (sh) {
-                    // X-Amz-SignedHeaders values are always lowercase (AWS SigV4 spec)
-                    const signedHeaders = sh.split(";");
-                    for (const h of signedHeaders) {
-                        if (h === "host") continue; // fetch sets Host automatically
-                        // Look for matching X-S3-{header} in our request (case-insensitive)
-                        let value = request.headers.get(`X-S3-${h}`);
-                        // Auto-fill x-amz-content-sha256 if not provided
-                        // (required when signed, standard value for presigned URLs is UNSIGNED-PAYLOAD)
-                        if (!value && h === "x-amz-content-sha256") {
-                            value = "UNSIGNED-PAYLOAD";
-                        }
-                        if (value) s3Headers.set(h, value);
-                    }
-                }
+                if (sh) signedHeadersList = sh.split(";");
             } catch (_) { }
 
-            // Extra safety: if Content-Type is in the URL query string, don't set it in headers
+            // Map each signed header to its value from X-S3-{name}
+            for (const h of signedHeadersList) {
+                if (h === "host") continue; // fetch sets Host
+                let value = request.headers.get(`X-S3-${h}`);
+                // Auto-fill sha256 with standard value for presigned URLs
+                if (!value && h === "x-amz-content-sha256") value = "UNSIGNED-PAYLOAD";
+                if (value) s3Headers.set(h, value);
+            }
+
+            // If Content-Type is in URL query string, remove from headers (S3 rule: can't be in both)
             if (s3Url.includes("Content-Type=") || s3Url.includes("content-type=")) {
                 s3Headers.delete("content-type");
                 s3Headers.delete("Content-Type");
             }
 
+            // CRITICAL: Wrap in Blob with empty type to prevent CF Workers from injecting
+            // "Content-Type: application/octet-stream" automatically.
+            // If content-type IS required by signing, we already set it in s3Headers above.
+            const bodyBlob = new Blob([bodyBuffer]);
+
+            // Debug: log what we're sending (visible in CF Workers dashboard logs)
+            console.log("[s3proxy] signedHeaders:", signedHeadersList.join(";"));
+            console.log("[s3proxy] sending headers:", [...s3Headers.entries()].map(([k, v]) => `${k}: ${v}`).join(", ") || "(none)");
+            console.log("[s3proxy] bodySize:", bodyBuffer.byteLength);
+
             const s3Resp = await fetch(s3Url, {
                 method: "PUT",
                 headers: s3Headers,
-                body: bodyBuffer,
+                body: bodyBlob,
             });
 
             const etag = s3Resp.headers.get("ETag") || "";
@@ -349,9 +356,14 @@ export default {
                 return jsonResp({ ok: true, etag: etag.replace(/"/g, "") }, 200);
             } else {
                 const errText = await s3Resp.text();
-                return jsonResp({ ok: false, status: s3Resp.status, error: errText.substring(0, 500) }, s3Resp.status);
+                return jsonResp({
+                    ok: false, status: s3Resp.status,
+                    error: errText.substring(0, 500),
+                    debug: { signedHeaders: signedHeadersList, sentHeaders: [...s3Headers.entries()] }
+                }, s3Resp.status);
             }
         }
+
 
         return jsonResp({ error: "Not found" }, 404);
     },
