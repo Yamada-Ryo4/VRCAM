@@ -545,6 +545,44 @@ function setProgress(pct, text) {
     if (text) txt.textContent = text;
 }
 
+// ── Patch Blueprint ID in .vrca AssetBundle ──
+// VRChat embeds the avatar's Blueprint ID (avtr_xxx) inside the .vrca file via VRCPipelineManager.
+// Security check fails if the embedded ID doesn't belong to the uploading user.
+// This function finds and replaces all avtr_ UUIDs in the binary data.
+function patchBlueprintId(vrcaBytes, newAvatarId) {
+    // avtr_ + UUID = 41 bytes: "avtr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    const AVTR_PREFIX = [0x61, 0x76, 0x74, 0x72, 0x5F]; // "avtr_"
+    const AVTR_LEN = 41; // avtr_ (5) + UUID (36)
+    const newIdBytes = new TextEncoder().encode(newAvatarId);
+    if (newIdBytes.length !== AVTR_LEN) {
+        logMsg(`Warning: new avatar ID length ${newIdBytes.length} != expected ${AVTR_LEN}`, 'error');
+    }
+
+    let patchCount = 0;
+    const data = new Uint8Array(vrcaBytes); // work on a copy
+
+    for (let i = 0; i < data.length - AVTR_LEN; i++) {
+        // Check for "avtr_" prefix
+        if (data[i] === 0x61 && data[i + 1] === 0x76 && data[i + 2] === 0x74 &&
+            data[i + 3] === 0x72 && data[i + 4] === 0x5F) {
+            // Verify this looks like a UUID: avtr_ + 8-4-4-4-12 hex pattern
+            const candidate = new TextDecoder().decode(data.subarray(i, i + AVTR_LEN));
+            if (/^avtr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(candidate)) {
+                const oldId = candidate;
+                // Replace with new ID
+                for (let j = 0; j < newIdBytes.length; j++) {
+                    data[i + j] = newIdBytes[j];
+                }
+                patchCount++;
+                logMsg(`Patched BlueprintId: ${oldId} → ${newAvatarId}`, 'info');
+            }
+        }
+    }
+
+    logMsg(`Patched ${patchCount} BlueprintId occurrence(s)`, patchCount > 0 ? 'success' : 'error');
+    return data;
+}
+
 async function startUpload() {
     if (uploadFiles.length === 0) return;
     const btn = document.getElementById('btnUpload');
@@ -563,9 +601,60 @@ async function startUpload() {
 
         try {
             setUploadStatus(`Processing ${file.name}...`);
-            const fileData = new Uint8Array(await file.arrayBuffer());
+            let fileData = new Uint8Array(await file.arrayBuffer());
+            let avatarId = null; // Will be set for isNew mode
 
-            // 1. Gzip compress the file
+            // ── For NEW avatars: create avatar FIRST to get avtr_ID, then patch .vrca ──
+            if (isNew) {
+                let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
+                if (!name) name = file.name.replace(/\.vrca$/i, '');
+
+                // Step A: Upload thumbnail image if selected
+                setProgress(2, 'Preparing avatar...');
+                let finalImageUrl = '';
+                const imgInput = document.getElementById('avatarImage');
+                if (imgInput && imgInput.files.length > 0) {
+                    try {
+                        finalImageUrl = await uploadImageToVRChat(imgInput.files[0], name || 'Avatar');
+                    } catch (err) {
+                        logMsg('Failed to upload thumbnail: ' + err.message, 'error');
+                    }
+                }
+                if (!finalImageUrl) {
+                    for (const av of avatars) {
+                        if (av.imageUrl) { finalImageUrl = av.imageUrl; break; }
+                        if (av.thumbnailImageUrl) { finalImageUrl = av.thumbnailImageUrl; break; }
+                    }
+                }
+                // Use a placeholder assetUrl — we'll update it after file upload
+                if (!finalImageUrl) finalImageUrl = 'https://api.vrchat.cloud/api/1/image/file_0e8c4e32-7444-44ea-ade4-8c2d1ce47b68/1/file';
+
+                // Step B: Create avatar record FIRST (with placeholder assetUrl)
+                setProgress(3, 'Creating avatar record...');
+                const rAvatar = await apiCall('/api/vrc/avatars', {
+                    method: 'POST', json: {
+                        name,
+                        assetUrl: 'https://api.vrchat.cloud/api/1/file/file_00000000-0000-0000-0000-000000000000/1/file',
+                        imageUrl: finalImageUrl,
+                        releaseStatus: 'private',
+                        unityPackageUrl: '',
+                        unityVersion: '2022.3.22f1',
+                        platform: 'standalonewindows',
+                        description: 'Uploaded via VRChat Asset Manager',
+                        tags: [],
+                    }
+                });
+                if (!rAvatar.ok) throw new Error('Failed to create avatar: ' + await rAvatar.text());
+                const avatarData = await rAvatar.json();
+                avatarId = avatarData.id; // e.g. "avtr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                logMsg(`Created avatar: ${avatarId}`, 'success');
+
+                // Step C: Patch .vrca BlueprintId with new avatar ID
+                setProgress(4, 'Patching BlueprintId...');
+                fileData = patchBlueprintId(fileData, avatarId);
+            }
+
+            // 1. Gzip compress the (possibly patched) file
             setProgress(5, 'Compressing...');
             const fileGz = await gzipCompress(fileData);
             const fileGzMd5 = md5(fileGz);
@@ -603,11 +692,11 @@ async function startUpload() {
                 const verData = await rVer.json();
                 versionId = verData.versions[verData.versions.length - 1].version;
             } else {
-                const avatarId = document.getElementById('avatarSelect').value;
-                if (!avatarId) throw new Error('No avatar selected');
+                const selAvatarId = document.getElementById('avatarSelect').value;
+                if (!selAvatarId) throw new Error('No avatar selected');
 
                 // Get avatar info to find file ID
-                const rAv = await apiCall(`/api/vrc/avatars/${avatarId}`);
+                const rAv = await apiCall(`/api/vrc/avatars/${selAvatarId}`);
                 const avData = await rAv.json();
                 for (const pkg of (avData.unityPackages || [])) {
                     if (['standalonewindows', 'pc'].includes(pkg.platform)) {
@@ -748,47 +837,18 @@ async function startUpload() {
             }
             if (!fileReady) throw new Error('File not ready after 5 minutes. It may still be processing — wait and try Update mode.');
 
-            // 8. Create/update avatar
-            if (isNew) {
-                let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
-                if (!name) name = file.name.replace(/\.vrca$/i, '');
-
-                // Handle Image Upload if file selected
-                let finalImageUrl = '';
-                const imgInput = document.getElementById('avatarImage');
-                if (imgInput && imgInput.files.length > 0) {
-                    try {
-                        const imgNamePrefix = name || 'Avatar';
-                        finalImageUrl = await uploadImageToVRChat(imgInput.files[0], imgNamePrefix);
-                    } catch (err) {
-                        logMsg('Failed to upload thumbnail: ' + err.message, 'error');
-                        // Fall back to empty to trigger default logic
-                    }
-                }
-
-                // Fall back to existing avatar's image if no image uploaded
-                if (!finalImageUrl) {
-                    for (const av of avatars) {
-                        if (av.imageUrl) { finalImageUrl = av.imageUrl; break; }
-                        if (av.thumbnailImageUrl) { finalImageUrl = av.thumbnailImageUrl; break; }
-                    }
-                }
-                if (!finalImageUrl) finalImageUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`;
-
-                const rAvatar = await apiCall('/api/vrc/avatars', {
-                    method: 'POST', json: {
-                        name,
-                        assetUrl: `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`,
-                        imageUrl: finalImageUrl,
-                        releaseStatus: 'private',
-                        unityPackageUrl: '',
-                        unityVersion: '2022.3.22f1',
-                        platform: 'standalonewindows',
-                        description: 'Uploaded via VRChat Asset Manager',
-                        tags: [],
-                    }
+            // 8. Update avatar with real assetUrl (avatar was created earlier with placeholder)
+            if (isNew && avatarId) {
+                setProgress(98, 'Updating avatar asset URL...');
+                const realAssetUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`;
+                const rUpdate = await apiCall(`/api/vrc/avatars/${avatarId}`, {
+                    method: 'PUT', json: { assetUrl: realAssetUrl }
                 });
-                if (!rAvatar.ok) throw new Error('Failed to create avatar: ' + await rAvatar.text());
+                if (!rUpdate.ok) {
+                    logMsg('Warning: avatar created but assetUrl update failed: ' + await rUpdate.text(), 'error');
+                } else {
+                    logMsg(`Avatar ${avatarId} updated with assetUrl`, 'success');
+                }
             }
 
             setProgress(100, 'Done!');
