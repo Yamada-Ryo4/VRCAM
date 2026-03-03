@@ -690,6 +690,7 @@ async function startUpload() {
                     headers: {
                         'X-S3-Url': partUrl,
                         'X-VRC-Auth': vrcAuth,
+                        'X-S3-content-type': 'application/gzip',
                     },
                 });
                 if (!rPartPut.ok) {
