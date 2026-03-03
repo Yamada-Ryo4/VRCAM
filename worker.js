@@ -353,6 +353,7 @@ export default {
 
             const etag = s3Resp.headers.get("ETag") || "";
             if (s3Resp.ok) {
+                // Strip quotes from ETag (Python version does .strip('"'), VRChat expects no quotes)
                 return jsonResp({ ok: true, etag: etag.replace(/"/g, "") }, 200);
             } else {
                 const errText = await s3Resp.text();
