@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VRChat Asset Manager</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <!-- ── Login Page ── -->
+    <div id="loginPage" class="login-container">
+        <div class="login-card">
+            <h2>VRChat Asset Manager</h2>
+            <p class="subtitle" data-i18n="loginSubtitle">Sign in with your VRChat account</p>
+            <div class="form-group">
+                <label data-i18n="labelUser">Username or Email</label>
+                <input type="text" id="username" class="input-field" placeholder="Enter your username">
+            </div>
+            <div class="form-group">
+                <label data-i18n="labelPass">Password</label>
+                <input type="password" id="password" class="input-field" placeholder="Enter your password">
+            </div>
+            <button onclick="doLogin()" id="btnLogin" class="btn btn-primary btn-block" data-i18n="btnSignIn">Sign
+                In</button>
+            <div id="login-error" class="login-error"></div>
+            <div id="tfa-section" class="tfa-section">
+                <p data-i18n="tfa2faRequired">Two-factor authentication required</p>
+                <div class="form-group">
+                    <label data-i18n="labelCode">Verification Code</label>
+                    <input type="text" id="tfaCode" class="input-field" placeholder="Enter 2FA code">
+                </div>
+                <button onclick="doVerify2FA()" class="btn btn-primary btn-block" data-i18n="btnVerify">Verify</button>
+            </div>
+            <div style="text-align:center;margin-top:16px;">
+                <div class="lang-switch">
+                    <button class="lang-btn" onclick="setLang('en')">EN</button>
+                    <button class="lang-btn active" onclick="setLang('zh')">中文</button>
+                    <button class="lang-btn" onclick="setLang('ja')">日本語</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Main App ── -->
+    <div id="mainApp" class="hidden">
+        <!-- Header -->
+        <header class="app-header">
+            <div style="display:flex;align-items:center;gap:8px;">
+                <span class="app-title">VRChat Asset Manager</span>
+                <span class="app-version">Workers Edition</span>
+            </div>
+            <div class="header-right">
+                <div class="tab-nav">
+                    <button class="tab-btn active" onclick="switchTab('download')"
+                        data-i18n="tabDownload">Download</button>
+                    <button class="tab-btn" onclick="switchTab('upload')" data-i18n="tabUpload">Upload</button>
+                </div>
+                <div class="lang-switch">
+                    <button class="lang-btn" onclick="setLang('en')">EN</button>
+                    <button class="lang-btn active" onclick="setLang('zh')">中文</button>
+                    <button class="lang-btn" onclick="setLang('ja')">日本語</button>
+                </div>
+                <button onclick="doLogout()" class="btn btn-danger" data-i18n="btnSignOut">Sign Out</button>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <!-- ── Download Panel ── -->
+            <div id="downloadPanel" class="download-panel active">
+                <div class="sidebar">
+                    <div class="sidebar-section">
+                        <h3 data-i18n="statTotal">Stats</h3>
+                        <div class="stats-bar">
+                            <span><i class="dot dot-total"></i> <span data-i18n="statTotal">Total</span>: <span
+                                    id="statTotal">0</span></span>
+                            <span><i class="dot dot-selected"></i> <span data-i18n="statSelected">Selected</span>: <span
+                                    id="statSelected">0</span></span>
+                        </div>
+                    </div>
+                    <div class="sidebar-section">
+                        <h3 data-i18n="actions">Actions</h3>
+                        <div class="btn-group">
+                            <button onclick="selectAll()" class="btn btn-secondary btn-block"
+                                data-i18n="btnSelectAll">Select All</button>
+                            <button onclick="downloadSelected()" class="btn btn-primary btn-block"
+                                data-i18n="btnDownload">Download Selected</button>
+                            <button onclick="fetchAvatars()" class="btn btn-secondary btn-block"
+                                data-i18n="btnRefresh">Refresh</button>
+                        </div>
+                    </div>
+                    <div class="sidebar-section" style="flex:1;display:flex;flex-direction:column;">
+                        <h3 data-i18n="console">Console</h3>
+                        <div id="logConsole" class="log-console"><span class="log-info" data-i18n="ready">Ready.</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="grid-area">
+                    <div id="avatarGrid" class="avatar-grid"></div>
+                </div>
+            </div>
+
+            <!-- ── Upload Panel ── -->
+            <div id="uploadPanel" class="upload-panel">
+                <div class="upload-area">
+                    <h3 style="margin-bottom:16px;" data-i18n="tabUpload">Upload</h3>
+                    <div class="upload-form">
+                        <div class="form-group">
+                            <label data-i18n="uploadMode">Upload Mode</label>
+                            <div class="radio-group">
+                                <div class="radio-option">
+                                    <input type="radio" name="uploadMode" id="modeNew" value="new" checked>
+                                    <label for="modeNew" data-i18n="modeNew">Create New</label>
+                                </div>
+                                <div class="radio-option">
+                                    <input type="radio" name="uploadMode" id="modeUpdate" value="update">
+                                    <label for="modeUpdate" data-i18n="modeUpdate">Update Existing</label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="file-drop-zone" id="dropZone"
+                            onclick="document.getElementById('fileInput').click()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M12 16V4m0 0l-4 4m4-4l4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" />
+                            </svg>
+                            <div class="drop-text" data-i18n="dropText">Click or drag .vrca files here</div>
+                            <div class="drop-hint" data-i18n="dropHint">Max 500 MB per file</div>
+                        </div>
+                        <input type="file" id="fileInput" accept=".vrca" multiple hidden>
+
+                        <div id="file-list-container" class="hidden">
+                            <div id="file-list" class="file-list"></div>
+                        </div>
+
+                        <div id="newFields">
+                            <div class="form-group">
+                                <label data-i18n="avatarName">Avatar Name</label>
+                                <input type="text" id="avatarName" class="input-field" placeholder="Enter avatar name">
+                            </div>
+                        </div>
+
+                        <div id="updateFields" class="hidden">
+                            <div class="form-group">
+                                <label data-i18n="selectAvatar">Select Avatar to Update</label>
+                                <select id="avatarSelect" class="input-field">
+                                    <option value="">-- Select --</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label data-i18n="proxyLabel">Proxy (optional)</label>
+                            <input type="text" id="proxyInput" class="input-field"
+                                placeholder="e.g. http://127.0.0.1:7897">
+                        </div>
+
+                        <div id="upload-progress" class="progress-bar-container">
+                            <div class="progress-bar-track">
+                                <div id="upload-progress-fill" class="progress-bar-fill"></div>
+                            </div>
+                            <div id="upload-progress-text" class="progress-text"></div>
+                        </div>
+                        <button onclick="startUpload()" id="btnUpload" class="btn btn-primary btn-block" disabled
+                            data-i18n="btnUpload">Upload</button>
+                        <div id="upload-status" class="upload-status"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>

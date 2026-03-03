@@ -1,0 +1,230 @@
+/**
+ * VRChat Asset Manager — Cloudflare Worker
+ * Proxies VRChat API calls to bypass CORS restrictions.
+ * The browser handles S3 uploads directly for maximum speed.
+ */
+
+const VRC_API = "https://api.vrchat.cloud/api/1";
+const API_KEY = "JlGlobalv959ay9puS6p99En0asKuAk";
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-VRC-Auth",
+  "Access-Control-Expose-Headers": "X-VRC-Auth",
+};
+
+function jsonResp(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders },
+  });
+}
+
+/**
+ * Forward a request to VRChat API, preserving auth cookies.
+ * Auth cookies are passed via X-VRC-Auth header (base64-encoded cookie string)
+ * since Workers can't share browser cookies cross-origin.
+ */
+async function vrcFetch(path, options = {}, authCookies = "") {
+  const url = `${VRC_API}${path}${path.includes("?") ? "&" : "?"}apiKey=${API_KEY}`;
+  const headers = {
+    "User-Agent": USER_AGENT,
+    ...(options.headers || {}),
+  };
+  if (authCookies) {
+    headers["Cookie"] = authCookies;
+  }
+  if (options.json) {
+    headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(options.json);
+    delete options.json;
+  }
+
+  const resp = await fetch(url, {
+    method: options.method || "GET",
+    headers,
+    body: options.body,
+    redirect: "manual",
+  });
+
+  // Collect set-cookie headers to pass back
+  const setCookies = resp.headers.getAll
+    ? resp.headers.getAll("set-cookie")
+    : [resp.headers.get("set-cookie")].filter(Boolean);
+
+  return { resp, setCookies };
+}
+
+function getAuth(request) {
+  const header = request.headers.get("X-VRC-Auth") || "";
+  if (!header) return "";
+  try {
+    return atob(header);
+  } catch {
+    return header;
+  }
+}
+
+function mergeCookies(existing, newCookies) {
+  const map = {};
+  // Parse existing
+  if (existing) {
+    existing.split(";").forEach((c) => {
+      const [k, ...v] = c.trim().split("=");
+      if (k) map[k.trim()] = v.join("=");
+    });
+  }
+  // Parse new set-cookie headers
+  newCookies.forEach((sc) => {
+    const [pair] = sc.split(";");
+    const [k, ...v] = pair.split("=");
+    if (k) map[k.trim()] = v.join("=");
+  });
+  return Object.entries(map)
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // Handle CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // Serve index.html for root
+    if (path === "/" || path === "/index.html") {
+      // In production, this would be served from Workers Sites / Pages
+      // For local dev, wrangler serves static files from the bucket
+      return env.ASSETS
+        ? env.ASSETS.fetch(request)
+        : new Response("Serve index.html via wrangler pages or static site", { status: 200 });
+    }
+
+    // ── API Routes ──
+    const auth = getAuth(request);
+
+    // POST /api/login
+    if (path === "/api/login" && request.method === "POST") {
+      const body = await request.json();
+      const basicAuth = btoa(`${body.username}:${body.password}`);
+
+      const { resp, setCookies } = await vrcFetch("/auth/user", {
+        method: "GET",
+        headers: { Authorization: `Basic ${basicAuth}` },
+      });
+
+      const data = await resp.json();
+      const cookies = mergeCookies("", setCookies);
+
+      if (resp.status === 200) {
+        const needs2FA =
+          data.requiresTwoFactorAuth && data.requiresTwoFactorAuth.length > 0;
+        return jsonResp(
+          { ok: true, needs2FA, user: data },
+          200,
+          { "X-VRC-Auth": btoa(cookies) }
+        );
+      }
+      return jsonResp({ ok: false, message: data.error?.message || "Login failed" }, resp.status);
+    }
+
+    // POST /api/2fa
+    if (path === "/api/2fa" && request.method === "POST") {
+      const body = await request.json();
+      const { resp, setCookies } = await vrcFetch(
+        "/auth/twofactorauth/totp/verify",
+        {
+          method: "POST",
+          json: { code: body.code },
+          headers: {},
+        },
+        auth
+      );
+
+      const data = await resp.json();
+      const cookies = mergeCookies(auth, setCookies);
+
+      if (resp.status === 200 && data.verified) {
+        return jsonResp({ ok: true }, 200, { "X-VRC-Auth": btoa(cookies) });
+      }
+      return jsonResp({ ok: false, message: "Invalid code" }, 400);
+    }
+
+    // GET /api/avatars
+    if (path === "/api/avatars" && request.method === "GET") {
+      // Get current user first
+      const { resp: userResp } = await vrcFetch("/auth/user", {}, auth);
+      if (userResp.status !== 200) {
+        return jsonResp({ error: "Not authenticated" }, 401);
+      }
+
+      const user = await userResp.json();
+      const avatarIds = user.currentAvatarAssetUrl
+        ? [user.currentAvatar, ...(user.fallbackAvatar ? [user.fallbackAvatar] : [])]
+        : [];
+
+      // Fetch all owned avatars
+      let allAvatars = [];
+      let offset = 0;
+      const limit = 100;
+      while (true) {
+        const { resp } = await vrcFetch(
+          `/avatars?releaseStatus=all&user=me&n=${limit}&offset=${offset}`,
+          {},
+          auth
+        );
+        if (resp.status !== 200) break;
+        const batch = await resp.json();
+        if (!batch || batch.length === 0) break;
+        allAvatars = allAvatars.concat(batch);
+        if (batch.length < limit) break;
+        offset += limit;
+      }
+
+      return jsonResp(allAvatars);
+    }
+
+    // Proxy any /api/vrc/* to VRChat API
+    if (path.startsWith("/api/vrc/")) {
+      const vrcPath = path.replace("/api/vrc", "");
+      const method = request.method;
+      let body = null;
+      let headers = {};
+
+      if (["POST", "PUT", "PATCH"].includes(method)) {
+        const ct = request.headers.get("content-type") || "";
+        if (ct.includes("application/json")) {
+          body = await request.text();
+          headers["Content-Type"] = "application/json";
+        }
+      }
+
+      const { resp, setCookies } = await vrcFetch(
+        vrcPath + url.search,
+        { method, body, headers },
+        auth
+      );
+
+      const respBody = await resp.text();
+      const cookies = mergeCookies(auth, setCookies);
+
+      return new Response(respBody, {
+        status: resp.status,
+        headers: {
+          "Content-Type": resp.headers.get("content-type") || "application/json",
+          ...CORS_HEADERS,
+          "X-VRC-Auth": btoa(cookies),
+        },
+      });
+    }
+
+    return jsonResp({ error: "Not found" }, 404);
+  },
+};
