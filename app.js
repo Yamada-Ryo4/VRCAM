@@ -753,9 +753,20 @@ async function startUpload() {
                 let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
                 if (!name) name = file.name.replace(/\.vrca$/i, '');
 
-                // Use user-provided imageUrl, or fall back to existing avatar's image
-                const userImageUrl = document.getElementById('avatarImageUrl')?.value.trim();
-                let finalImageUrl = userImageUrl || '';
+                // Handle Image Upload if file selected
+                let finalImageUrl = '';
+                const imgInput = document.getElementById('avatarImage');
+                if (imgInput && imgInput.files.length > 0) {
+                    try {
+                        const imgNamePrefix = name || 'Avatar';
+                        finalImageUrl = await uploadImageToVRChat(imgInput.files[0], imgNamePrefix);
+                    } catch (err) {
+                        logMsg('Failed to upload thumbnail: ' + err.message, 'error');
+                        // Fall back to empty to trigger default logic
+                    }
+                }
+
+                // Fall back to existing avatar's image if no image uploaded
                 if (!finalImageUrl) {
                     for (const av of avatars) {
                         if (av.imageUrl) { finalImageUrl = av.imageUrl; break; }
