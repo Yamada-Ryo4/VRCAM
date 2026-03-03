@@ -545,6 +545,107 @@ function setProgress(pct, text) {
     if (text) txt.textContent = text;
 }
 
+// ── Resize image to 1200x900 (4:3) using Canvas ──
+async function resizeImageTo4x3(file) {
+    const TARGET_W = 1200, TARGET_H = 900;
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = TARGET_W;
+            canvas.height = TARGET_H;
+            const ctx = canvas.getContext('2d');
+
+            // Fill black background, then draw image centered/cropped to 4:3
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, TARGET_W, TARGET_H);
+
+            // Calculate crop: cover the 4:3 area
+            const srcRatio = img.width / img.height;
+            const dstRatio = TARGET_W / TARGET_H;
+            let sx = 0, sy = 0, sw = img.width, sh = img.height;
+            if (srcRatio > dstRatio) {
+                // Source is wider — crop sides
+                sw = img.height * dstRatio;
+                sx = (img.width - sw) / 2;
+            } else {
+                // Source is taller — crop top/bottom
+                sh = img.width / dstRatio;
+                sy = (img.height - sh) / 2;
+            }
+
+            ctx.drawImage(img, sx, sy, sw, sh, 0, 0, TARGET_W, TARGET_H);
+
+            canvas.toBlob(blob => {
+                if (!blob) return reject(new Error('Canvas toBlob failed'));
+                blob.arrayBuffer().then(buf => resolve(new Uint8Array(buf)));
+            }, 'image/png');
+        };
+        img.onerror = () => reject(new Error('Failed to load image'));
+        img.src = URL.createObjectURL(file);
+    });
+}
+
+// ── Upload Image to VRChat File API ──
+// Resizes to 1200x900 (4:3), uploads via File API, returns VRChat file URL
+async function uploadImageToVRChat(file, namePrefix) {
+    logMsg('Resizing image to 1200x900 (4:3)...', 'info');
+    const fileData = await resizeImageTo4x3(file);
+    logMsg(`Image resized: ${fileData.length} bytes`, 'info');
+
+    if (fileData.length > 10 * 1024 * 1024) throw new Error('Image too large after resize (max 10MB).');
+    const fileMd5 = md5(fileData);
+
+    // 1. Create file record
+    const rFile = await apiCall('/api/vrc/file', {
+        method: 'POST', json: { name: namePrefix + ' Image', mimeType: 'image/png', extension: 'png', tags: [] }
+    });
+    if (!rFile.ok) throw new Error('Failed to create image file: ' + await rFile.text());
+    const imgFileId = (await rFile.json()).id;
+
+    // 2. Create version
+    const rVer = await apiCall(`/api/vrc/file/${imgFileId}`, {
+        method: 'POST', json: { signatureMd5: '', signatureSizeInBytes: 0, fileMd5, fileSizeInBytes: fileData.length }
+    });
+    if (!rVer.ok) throw new Error('Failed to create image version: ' + await rVer.text());
+    const imgVersionId = (await rVer.json()).versions?.slice(-1)[0]?.version ?? 1;
+
+    // 3. Start file upload (Simple Mode)
+    const rPartStart = await apiCall(`/api/vrc/file/${imgFileId}/${imgVersionId}/file/start?partNumber=1`, { method: 'PUT' });
+    if (!rPartStart.ok) throw new Error('Image start failed: ' + await rPartStart.text());
+    const partUrl = (await rPartStart.json()).url;
+
+    // 4. Upload to S3 via proxy
+    const rPartPut = await fetch(`${API_BASE}/api/s3proxy`, {
+        method: 'PUT', body: fileData, headers: {
+            'X-S3-Url': partUrl, 'X-VRC-Auth': vrcAuth, 'X-S3-content-md5': fileMd5
+        }
+    });
+    if (!rPartPut.ok) throw new Error('Image S3 upload failed: ' + await rPartPut.text());
+
+    // 5. Finish upload (Simple mode: no etags)
+    const rFinish = await apiCall(`/api/vrc/file/${imgFileId}/${imgVersionId}/file/finish`, {
+        method: 'PUT', json: { nextPartNumber: '0', maxParts: '0' }
+    });
+    if (!rFinish.ok) throw new Error('Image finalize failed: ' + await rFinish.text());
+
+    // 6. Poll for completion (images are usually fast)
+    for (let attempt = 0; attempt < 15; attempt++) {
+        await new Promise(r => setTimeout(r, 2000));
+        const rStatus = await apiCall(`/api/vrc/file/${imgFileId}`);
+        if (rStatus.ok) {
+            const ver = ((await rStatus.json()).versions || []).find(v => v.version === parseInt(imgVersionId));
+            if (ver && ver.status === 'complete') {
+                const url = `https://api.vrchat.cloud/api/1/file/${imgFileId}/${imgVersionId}/file`;
+                logMsg(`Image uploaded: ${url}`, 'success');
+                return url;
+            }
+        }
+    }
+    throw new Error('Image processing timed out.');
+}
+
+
 // ── Patch Blueprint ID in .vrca AssetBundle ──
 // VRChat embeds the avatar's Blueprint ID (avtr_xxx) inside the .vrca file via VRCPipelineManager.
 // Security check fails if the embedded ID doesn't belong to the uploading user.
@@ -604,53 +705,14 @@ async function startUpload() {
             let fileData = new Uint8Array(await file.arrayBuffer());
             let avatarId = null; // Will be set for isNew mode
 
-            // ── For NEW avatars: create avatar FIRST to get avtr_ID, then patch .vrca ──
+            // ── For NEW avatars: generate our own avtr_ID, patch .vrca BEFORE upload ──
             if (isNew) {
-                let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
-                if (!name) name = file.name.replace(/\.vrca$/i, '');
+                // Generate a new avatar ID locally (avtr_ + UUID v4)
+                avatarId = 'avtr_' + crypto.randomUUID();
+                logMsg(`Generated avatar ID: ${avatarId}`, 'info');
 
-                // Step A: Upload thumbnail image if selected
-                setProgress(2, 'Preparing avatar...');
-                let finalImageUrl = '';
-                const imgInput = document.getElementById('avatarImage');
-                if (imgInput && imgInput.files.length > 0) {
-                    try {
-                        finalImageUrl = await uploadImageToVRChat(imgInput.files[0], name || 'Avatar');
-                    } catch (err) {
-                        logMsg('Failed to upload thumbnail: ' + err.message, 'error');
-                    }
-                }
-                if (!finalImageUrl) {
-                    for (const av of avatars) {
-                        if (av.imageUrl) { finalImageUrl = av.imageUrl; break; }
-                        if (av.thumbnailImageUrl) { finalImageUrl = av.thumbnailImageUrl; break; }
-                    }
-                }
-                // Use a placeholder assetUrl — we'll update it after file upload
-                if (!finalImageUrl) finalImageUrl = 'https://api.vrchat.cloud/api/1/image/file_0e8c4e32-7444-44ea-ade4-8c2d1ce47b68/1/file';
-
-                // Step B: Create avatar record FIRST (with placeholder assetUrl)
-                setProgress(3, 'Creating avatar record...');
-                const rAvatar = await apiCall('/api/vrc/avatars', {
-                    method: 'POST', json: {
-                        name,
-                        assetUrl: 'https://api.vrchat.cloud/api/1/file/file_00000000-0000-0000-0000-000000000000/1/file',
-                        imageUrl: finalImageUrl,
-                        releaseStatus: 'private',
-                        unityPackageUrl: '',
-                        unityVersion: '2022.3.22f1',
-                        platform: 'standalonewindows',
-                        description: 'Uploaded via VRChat Asset Manager',
-                        tags: [],
-                    }
-                });
-                if (!rAvatar.ok) throw new Error('Failed to create avatar: ' + await rAvatar.text());
-                const avatarData = await rAvatar.json();
-                avatarId = avatarData.id; // e.g. "avtr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                logMsg(`Created avatar: ${avatarId}`, 'success');
-
-                // Step C: Patch .vrca BlueprintId with new avatar ID
-                setProgress(4, 'Patching BlueprintId...');
+                // Patch .vrca BlueprintId with our new avatar ID
+                setProgress(3, 'Patching BlueprintId...');
                 fileData = patchBlueprintId(fileData, avatarId);
             }
 
@@ -837,18 +899,46 @@ async function startUpload() {
             }
             if (!fileReady) throw new Error('File not ready after 5 minutes. It may still be processing — wait and try Update mode.');
 
-            // 8. Update avatar with real assetUrl (avatar was created earlier with placeholder)
+            // 8. Create avatar with our pre-generated ID and real assetUrl
             if (isNew && avatarId) {
-                setProgress(98, 'Updating avatar asset URL...');
-                const realAssetUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`;
-                const rUpdate = await apiCall(`/api/vrc/avatars/${avatarId}`, {
-                    method: 'PUT', json: { assetUrl: realAssetUrl }
-                });
-                if (!rUpdate.ok) {
-                    logMsg('Warning: avatar created but assetUrl update failed: ' + await rUpdate.text(), 'error');
-                } else {
-                    logMsg(`Avatar ${avatarId} updated with assetUrl`, 'success');
+                setProgress(98, 'Creating avatar record...');
+                let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
+                if (!name) name = file.name.replace(/\.vrca$/i, '');
+
+                // Upload thumbnail image if selected
+                let finalImageUrl = '';
+                const imgInput = document.getElementById('avatarImage');
+                if (imgInput && imgInput.files.length > 0) {
+                    try {
+                        finalImageUrl = await uploadImageToVRChat(imgInput.files[0], name || 'Avatar');
+                    } catch (err) {
+                        logMsg('Failed to upload thumbnail: ' + err.message, 'error');
+                    }
                 }
+                if (!finalImageUrl) {
+                    for (const av of avatars) {
+                        if (av.imageUrl) { finalImageUrl = av.imageUrl; break; }
+                        if (av.thumbnailImageUrl) { finalImageUrl = av.thumbnailImageUrl; break; }
+                    }
+                }
+                if (!finalImageUrl) finalImageUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`;
+
+                const rAvatar = await apiCall('/api/vrc/avatars', {
+                    method: 'POST', json: {
+                        id: avatarId,
+                        name,
+                        assetUrl: `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`,
+                        imageUrl: finalImageUrl,
+                        releaseStatus: 'private',
+                        unityPackageUrl: '',
+                        unityVersion: '2022.3.22f1',
+                        platform: 'standalonewindows',
+                        description: 'Uploaded via VRChat Asset Manager',
+                        tags: [],
+                    }
+                });
+                if (!rAvatar.ok) throw new Error('Failed to create avatar: ' + await rAvatar.text());
+                logMsg(`Avatar created: ${avatarId}`, 'success');
             }
 
             setProgress(100, 'Done!');
