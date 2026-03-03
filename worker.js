@@ -224,6 +224,39 @@ export default {
                 },
             });
         }
+        // POST /api/resolve-url — Resolve a VRChat file URL to a real CDN URL (follows redirects with auth)
+        if (path === "/api/resolve-url" && request.method === "POST") {
+            const body = await request.json();
+            const vrcUrl = body.url;
+            if (!vrcUrl) return jsonResp({ error: "Missing url" }, 400);
+
+            // Fetch with auth cookies; VRChat /file/.../file returns 302 -> S3 presigned URL
+            const resp = await fetch(vrcUrl, {
+                method: "GET",
+                headers: {
+                    "User-Agent": USER_AGENT,
+                    ...(auth ? { "Cookie": auth } : {}),
+                },
+                redirect: "manual",   // Don't auto-follow — grab the Location header
+            });
+
+            // Expect a 302 redirect to the real CDN URL
+            if (resp.status === 302 || resp.status === 301) {
+                const cdnUrl = resp.headers.get("Location");
+                if (cdnUrl) return jsonResp({ cdnUrl }, 200);
+            }
+
+            // Some older URLs redirect multiple times — follow once more
+            if (resp.status >= 200 && resp.status < 300) {
+                // Directly returned the file — shouldn't happen but handle gracefully
+                return jsonResp({ cdnUrl: vrcUrl }, 200);
+            }
+
+            if (resp.status === 401) return jsonResp({ error: "VRChat auth expired, please log out and back in" }, 401);
+
+            return jsonResp({ error: `VRChat returned ${resp.status}` }, resp.status);
+        }
+
         // POST /api/s3proxy — Proxy S3 uploads (bypass CORS)
         // Body: raw file data, Headers: X-S3-Url (the pre-signed URL), optional Content-Type/Content-MD5
         if (path === "/api/s3proxy" && request.method === "PUT") {

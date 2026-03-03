@@ -233,9 +233,21 @@ async function downloadSelected() {
 
         try {
             logMsg(`⬇ Downloading ${av.name}...`, 'info');
-            // Use browser download via <a> tag
+
+            // VRChat's /file/.../file endpoint requires auth cookies — resolve the real CDN URL via Worker
+            const rResolve = await apiCall('/api/resolve-url', {
+                method: 'POST',
+                json: { url }
+            });
+            if (!rResolve.ok) {
+                const err = await rResolve.json().catch(() => ({}));
+                throw new Error(err.error || `Resolve failed (${rResolve.status})`);
+            }
+            const { cdnUrl } = await rResolve.json();
+
+            // Trigger browser download from S3/CDN (no auth needed)
             const a = document.createElement('a');
-            a.href = url;
+            a.href = cdnUrl;
             a.download = `${av.name}_${av.id}.vrca`;
             a.style.display = 'none';
             document.body.appendChild(a);
@@ -243,8 +255,7 @@ async function downloadSelected() {
             document.body.removeChild(a);
             logMsg(`✓ ${av.name}: Download started`, 'success');
             if (card) { card.classList.remove('downloading'); card.classList.add('success'); }
-            // Small delay between downloads
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 800));
         } catch (e) {
             logMsg(`✗ ${av.name}: ${e.message}`, 'error');
             if (card) { card.classList.remove('downloading'); card.classList.add('skipped'); }
