@@ -22,7 +22,6 @@ const I18N = {
         uploadMode: "Upload Mode", modeNew: "Create New", modeUpdate: "Update Existing",
         dropText: "Click or drag .vrca files here", dropHint: "Max 500 MB per file",
         avatarName: "Avatar Name", selectAvatar: "Select Avatar to Update", btnUpload: "Upload",
-        proxyLabel: "Proxy (optional)", phProxy: "e.g. http://127.0.0.1:7897",
         uploading: "Uploading...", uploadOk: "Upload successful!", uploadFail: "Upload failed: ",
     },
     zh: {
@@ -34,7 +33,6 @@ const I18N = {
         uploadMode: "上传模式", modeNew: "新建", modeUpdate: "更新已有",
         dropText: "点击或拖拽 .vrca 文件到这里", dropHint: "每个文件最大 500 MB",
         avatarName: "模型名称", selectAvatar: "选择要更新的模型", btnUpload: "上传",
-        proxyLabel: "代理（可选）", phProxy: "例如 http://127.0.0.1:7897",
         uploading: "上传中...", uploadOk: "上传成功！", uploadFail: "上传失败：",
     },
     ja: {
@@ -46,7 +44,6 @@ const I18N = {
         uploadMode: "アップロードモード", modeNew: "新規作成", modeUpdate: "既存を更新",
         dropText: ".vrcaファイルをここにドラッグ", dropHint: "最大500MB",
         avatarName: "アバター名", selectAvatar: "更新するアバターを選択", btnUpload: "アップロード",
-        proxyLabel: "プロキシ（任意）", phProxy: "例: http://127.0.0.1:7897",
         uploading: "アップロード中...", uploadOk: "アップロード成功！", uploadFail: "アップロード失敗：",
     }
 };
@@ -146,9 +143,6 @@ function showMainApp() {
     document.getElementById('loginPage').classList.add('hidden');
     document.getElementById('mainApp').classList.remove('hidden');
     fetchAvatars();
-    const savedProxy = localStorage.getItem('vrc_proxy') || '';
-    const pi = document.getElementById('proxyInput');
-    if (pi && savedProxy) pi.value = savedProxy;
 }
 
 // ── Tabs ──
@@ -320,11 +314,7 @@ function removeFile(i) {
     document.getElementById('btnUpload').disabled = uploadFiles.length === 0;
 }
 
-// ── Proxy save ──
-const proxyInput = document.getElementById('proxyInput');
-if (proxyInput) {
-    proxyInput.addEventListener('change', function () { localStorage.setItem('vrc_proxy', this.value); });
-}
+// (proxy input removed — CF Workers version uploads via /api/s3proxy)
 
 // ── MD5 (using SubtleCrypto isn't available for MD5, use simple implementation) ──
 function md5(buffer) {
@@ -553,8 +543,6 @@ async function startUpload() {
     const btn = document.getElementById('btnUpload');
     btn.disabled = true;
     const isNew = document.getElementById('modeNew').checked;
-    const proxy = document.getElementById('proxyInput').value.trim();
-    if (proxy) localStorage.setItem('vrc_proxy', proxy);
 
     setUploadStatus(t('uploading'));
     setProgress(0, '');
@@ -633,18 +621,27 @@ async function startUpload() {
                 versionId = verData.versions[verData.versions.length - 1].version;
             }
 
-            // 4. Upload signature (simple, small)
+            // 4. Upload signature via Worker proxy (avoids S3 CORS)
             setProgress(20, 'Uploading signature...');
             const rSigStart = await apiCall(`/api/vrc/file/${fileId}/${versionId}/signature/start`, { method: 'PUT' });
-            if (!rSigStart.ok) throw new Error('Failed to start sig upload');
+            if (!rSigStart.ok) throw new Error('Failed to start sig upload: ' + await rSigStart.text());
             const sigUrl = (await rSigStart.json()).url;
 
-            // Direct S3 PUT for signature
-            const rSigPut = await fetch(sigUrl, {
-                method: 'PUT', body: sigGz,
-                headers: { 'Content-Type': 'application/gzip', 'Content-MD5': sigGzMd5 },
+            // Proxy S3 PUT through Worker to bypass CORS
+            const rSigPut = await fetch(`${API_BASE}/api/s3proxy`, {
+                method: 'PUT',
+                body: sigGz,
+                headers: {
+                    'X-S3-Url': sigUrl,
+                    'X-S3-Content-Type': 'application/gzip',
+                    'X-S3-Content-MD5': sigGzMd5,
+                    'X-VRC-Auth': vrcAuth,
+                },
             });
-            if (!rSigPut.ok) throw new Error('Signature S3 upload failed: ' + rSigPut.status);
+            if (!rSigPut.ok) {
+                const errText = await rSigPut.text();
+                throw new Error('Signature S3 upload failed: ' + errText.substring(0, 200));
+            }
 
             // Finish signature
             const rSigFinish = await apiCall(`/api/vrc/file/${fileId}/${versionId}/signature/finish`, {
@@ -655,7 +652,7 @@ async function startUpload() {
                 const retry = await apiCall(`/api/vrc/file/${fileId}/${versionId}/signature/finish`, {
                     method: 'PUT', json: { etags: [], nextPartNumber: '0', maxParts: '0' }
                 });
-                if (!retry.ok) throw new Error('Failed to finalize signature');
+                if (!retry.ok) throw new Error('Failed to finalize signature: ' + await retry.text());
             }
 
             // 5. Upload file (multipart, 10MB chunks) — DIRECT TO S3!
@@ -669,35 +666,32 @@ async function startUpload() {
                 const chunk = fileGz.subarray(pOffset, Math.min(pOffset + CHUNK_SIZE, fileGz.length));
 
                 const rPartStart = await apiCall(`/api/vrc/file/${fileId}/${versionId}/file/start?partNumber=${partNum}`, { method: 'PUT' });
-                if (!rPartStart.ok) throw new Error(`Part ${partNum} start failed`);
+                if (!rPartStart.ok) throw new Error(`Part ${partNum} start failed: ` + await rPartStart.text());
                 const partUrl = (await rPartStart.json()).url;
 
-                // Direct S3 PUT with XHR for progress
-                const partResult = await new Promise((resolve, reject) => {
-                    const xhr = new XMLHttpRequest();
-                    xhr.open('PUT', partUrl);
-                    xhr.upload.onprogress = (e) => {
-                        if (e.lengthComputable) {
-                            const partPct = e.loaded / e.total;
-                            const overall = 25 + ((partNum - 1 + partPct) / totalParts) * 70;
-                            const uploaded = (pOffset + e.loaded) / 1048576;
-                            const total = fileGz.length / 1048576;
-                            setProgress(overall, `Part ${partNum}/${totalParts}: ${uploaded.toFixed(1)}/${total.toFixed(1)} MB`);
-                        }
-                    };
-                    xhr.onload = () => {
-                        if (xhr.status >= 200 && xhr.status < 300) {
-                            const etag = xhr.getResponseHeader('ETag');
-                            resolve(etag ? etag.replace(/"/g, '') : '');
-                        } else {
-                            reject(new Error(`S3 part ${partNum} failed (${xhr.status})`));
-                        }
-                    };
-                    xhr.onerror = () => reject(new Error(`S3 part ${partNum} network error`));
-                    xhr.send(chunk);
-                });
+                // Proxy S3 PUT through Worker (no direct S3 CORS needed)
+                const pctBefore = 25 + ((partNum - 1) / totalParts) * 70;
+                const pctAfter = 25 + (partNum / totalParts) * 70;
+                const uploadedBefore = pOffset / 1048576;
+                const totalMB = fileGz.length / 1048576;
+                setProgress(pctBefore, `Part ${partNum}/${totalParts}: ${uploadedBefore.toFixed(1)}/${totalMB.toFixed(1)} MB`);
 
-                if (partResult) etags.push(partResult);
+                const rPartPut = await fetch(`${API_BASE}/api/s3proxy`, {
+                    method: 'PUT',
+                    body: chunk,
+                    headers: {
+                        'X-S3-Url': partUrl,
+                        'X-VRC-Auth': vrcAuth,
+                    },
+                });
+                if (!rPartPut.ok) {
+                    const errText = await rPartPut.text();
+                    throw new Error(`S3 part ${partNum} failed: ` + errText.substring(0, 200));
+                }
+                const partJson = await rPartPut.json();
+                if (partJson.etag) etags.push(partJson.etag);
+
+                setProgress(pctAfter, `Part ${partNum}/${totalParts}: ${((pOffset + chunk.length) / 1048576).toFixed(1)}/${totalMB.toFixed(1)} MB`);
             }
 
             // 6. Finish file upload
@@ -705,23 +699,47 @@ async function startUpload() {
             const rFileFinish = await apiCall(`/api/vrc/file/${fileId}/${versionId}/file/finish`, {
                 method: 'PUT', json: { etags, nextPartNumber: '0', maxParts: '0' }
             });
-            if (!rFileFinish.ok) throw new Error('Failed to finalize file');
+            if (!rFileFinish.ok) throw new Error('Failed to finalize file: ' + await rFileFinish.text());
 
-            // 7. Create/update avatar
+            // 7. Wait for file status to become 'complete' before creating avatar
+            setProgress(97, 'Waiting for file to be processed...');
+            for (let attempt = 0; attempt < 30; attempt++) {
+                await new Promise(r => setTimeout(r, 3000));
+                const rStatus = await apiCall(`/api/vrc/file/${fileId}/${versionId}`);
+                if (rStatus.ok) {
+                    const statusData = await rStatus.json();
+                    const versions = statusData.versions || [];
+                    const ver = versions.find(v => v.version === versionId) || versions[versions.length - 1];
+                    if (ver) {
+                        const fileStatus = (ver.file || {}).status;
+                        const sigStatus = (ver.signature || {}).status;
+                        logMsg(`File status: ${fileStatus}, Sig: ${sigStatus}`, 'info');
+                        if (fileStatus === 'complete' && sigStatus === 'complete') break;
+                        if (fileStatus === 'error' || sigStatus === 'error') {
+                            throw new Error(`File processing failed: file=${fileStatus} sig=${sigStatus}`);
+                        }
+                    }
+                }
+            }
+
+            // 8. Create/update avatar
             if (isNew) {
                 let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
                 if (!name) name = file.name.replace(/\.vrca$/i, '');
 
                 const rAvatar = await apiCall('/api/vrc/avatars', {
                     method: 'POST', json: {
-                        name, assetUrl: `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`,
-                        imageUrl: 'https://assets.vrchat.com/www/images/default_avtr_image.png',
+                        name,
+                        assetUrl: `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`,
+                        imageUrl: 'https://api.vrchat.cloud/api/1/file/file_0e8c4e32-7444-44ea-ade4-8c2d1ce47b68/1/file',
                         id: '', releaseStatus: 'private',
                         unityPackageUrl: '', unityVersion: '2022.3.22f1',
                         platform: 'standalonewindows',
+                        description: 'Uploaded via VRChat Asset Manager',
+                        tags: [],
                     }
                 });
-                if (!rAvatar.ok) throw new Error('Failed to create avatar');
+                if (!rAvatar.ok) throw new Error('Failed to create avatar: ' + await rAvatar.text());
             }
 
             setProgress(100, 'Done!');
