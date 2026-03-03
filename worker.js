@@ -321,7 +321,12 @@ export default {
                     for (const h of signedHeaders) {
                         if (h === "host") continue; // fetch sets Host automatically
                         // Look for matching X-S3-{header} in our request (case-insensitive)
-                        const value = request.headers.get(`X-S3-${h}`);
+                        let value = request.headers.get(`X-S3-${h}`);
+                        // Auto-fill x-amz-content-sha256 if not provided
+                        // (required when signed, standard value for presigned URLs is UNSIGNED-PAYLOAD)
+                        if (!value && h === "x-amz-content-sha256") {
+                            value = "UNSIGNED-PAYLOAD";
+                        }
                         if (value) s3Headers.set(h, value);
                     }
                 }

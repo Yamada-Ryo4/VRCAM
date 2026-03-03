@@ -690,7 +690,8 @@ async function startUpload() {
                     headers: {
                         'X-S3-Url': partUrl,
                         'X-VRC-Auth': vrcAuth,
-                        'X-S3-content-type': 'application/gzip',
+                        // No X-S3-content-type — Worker reads X-Amz-SignedHeaders dynamically
+                        // x-amz-content-sha256 is auto-filled by worker if required
                     },
                 });
                 if (!rPartPut.ok) {
