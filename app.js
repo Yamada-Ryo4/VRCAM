@@ -753,11 +753,22 @@ async function startUpload() {
                 let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
                 if (!name) name = file.name.replace(/\.vrca$/i, '');
 
+                // Use user-provided imageUrl, or fall back to existing avatar's image
+                const userImageUrl = document.getElementById('avatarImageUrl')?.value.trim();
+                let finalImageUrl = userImageUrl || '';
+                if (!finalImageUrl) {
+                    for (const av of avatars) {
+                        if (av.imageUrl) { finalImageUrl = av.imageUrl; break; }
+                        if (av.thumbnailImageUrl) { finalImageUrl = av.thumbnailImageUrl; break; }
+                    }
+                }
+                if (!finalImageUrl) finalImageUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`;
+
                 const rAvatar = await apiCall('/api/vrc/avatars', {
                     method: 'POST', json: {
                         name,
                         assetUrl: `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`,
-                        imageUrl: 'https://api.vrchat.cloud/api/1/file/file_0e8c4e32-7444-44ea-ade4-8c2d1ce47b68/1/file',
+                        imageUrl: finalImageUrl,
                         releaseStatus: 'private',
                         unityPackageUrl: '',
                         unityVersion: '2022.3.22f1',
