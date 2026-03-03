@@ -720,16 +720,19 @@ async function startUpload() {
             if (!rFileFinish.ok) throw new Error('Failed to finalize file: ' + await rFileFinish.text());
 
             // 7. Wait for file status to become 'complete' before creating avatar
-            // Large files (100MB+) can take several minutes to process on VRChat's side
+            // NOTE: GET /file/{fileId}/{versionId} returns 302 redirect (download URL), NOT status!
+            // Must use GET /file/{fileId} which returns all versions with their status.
             setProgress(97, 'Waiting for file to be processed...');
             let fileReady = false;
             const maxAttempts = 60;  // 60 × 5s = 5 minutes max
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
                 await new Promise(r => setTimeout(r, 5000));
-                const rStatus = await apiCall(`/api/vrc/file/${fileId}/${versionId}`);
+                const rStatus = await apiCall(`/api/vrc/file/${fileId}`);
                 if (rStatus.ok) {
-                    const ver = await rStatus.json();
-                    const status = ver.status || 'unknown';
+                    const fileObj = await rStatus.json();
+                    // Find our version in the versions array
+                    const ver = (fileObj.versions || []).find(v => v.version === parseInt(versionId));
+                    const status = ver ? ver.status : 'unknown';
                     const elapsed = ((attempt + 1) * 5);
                     logMsg(`Attempt ${attempt + 1}/${maxAttempts} (${elapsed}s) — status: ${status}`, 'info');
                     if (status === 'complete') {
