@@ -224,6 +224,43 @@ export default {
                 },
             });
         }
+        // GET /api/download?url=...&filename=... — Proxy download with correct filename
+        // Since this response is same-origin, browser `a.download` attribute works correctly.
+        if (path === "/api/download" && request.method === "GET") {
+            const vrcUrl = url.searchParams.get("url");
+            const filename = url.searchParams.get("filename") || "avatar.vrca";
+            if (!vrcUrl) return jsonResp({ error: "Missing url param" }, 400);
+
+            // Step 1: Resolve VRChat file URL → S3 CDN URL (follows one redirect with auth)
+            const step1 = await fetch(vrcUrl, {
+                method: "GET",
+                headers: { "User-Agent": USER_AGENT, ...(auth ? { "Cookie": auth } : {}) },
+                redirect: "manual",
+            });
+
+            let cdnUrl = vrcUrl;
+            if (step1.status === 301 || step1.status === 302) {
+                cdnUrl = step1.headers.get("Location") || vrcUrl;
+            } else if (step1.status === 401) {
+                return jsonResp({ error: "VRChat auth expired" }, 401);
+            }
+
+            // Step 2: Fetch from CDN and stream back with Content-Disposition
+            const cdnResp = await fetch(cdnUrl, { method: "GET" });
+            if (!cdnResp.ok) return jsonResp({ error: `CDN fetch failed: ${cdnResp.status}` }, cdnResp.status);
+
+            const safeFilename = encodeURIComponent(filename);
+            return new Response(cdnResp.body, {
+                status: 200,
+                headers: {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Disposition": `attachment; filename="${filename}"; filename*=UTF-8''${safeFilename}`,
+                    "Content-Length": cdnResp.headers.get("Content-Length") || "",
+                    ...CORS_HEADERS,
+                },
+            });
+        }
+
         // POST /api/resolve-url — Resolve a VRChat file URL to a real CDN URL (follows redirects with auth)
         if (path === "/api/resolve-url" && request.method === "POST") {
             const body = await request.json();

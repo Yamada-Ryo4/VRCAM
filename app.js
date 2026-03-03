@@ -234,26 +234,20 @@ async function downloadSelected() {
         try {
             logMsg(`⬇ Downloading ${av.name}...`, 'info');
 
-            // VRChat's /file/.../file endpoint requires auth cookies — resolve the real CDN URL via Worker
-            const rResolve = await apiCall('/api/resolve-url', {
-                method: 'POST',
-                json: { url }
-            });
-            if (!rResolve.ok) {
-                const err = await rResolve.json().catch(() => ({}));
-                throw new Error(err.error || `Resolve failed (${rResolve.status})`);
-            }
-            const { cdnUrl } = await rResolve.json();
+            // Build filename: 模型名_avtr_xxxx.vrca (sanitize for filesystem)
+            const safeName = av.name.replace(/[\\/*?:"<>|]/g, '_');
+            const filename = `${safeName}_${av.id}.vrca`;
 
-            // Trigger browser download from S3/CDN (no auth needed)
+            // Use Worker download proxy: same-origin, so Content-Disposition/filename works correctly
+            const proxyUrl = `${API_BASE}/api/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}`;
             const a = document.createElement('a');
-            a.href = cdnUrl;
-            a.download = `${av.name}_${av.id}.vrca`;
+            a.href = proxyUrl;
+            a.download = filename;
             a.style.display = 'none';
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
-            logMsg(`✓ ${av.name}: Download started`, 'success');
+            logMsg(`✓ ${av.name}: Download started → ${filename}`, 'success');
             if (card) { card.classList.remove('downloading'); card.classList.add('success'); }
             await new Promise(r => setTimeout(r, 800));
         } catch (e) {
@@ -263,6 +257,7 @@ async function downloadSelected() {
     }
     logMsg('All downloads initiated!', 'success');
 }
+
 
 // ── Console ──
 function logMsg(msg, type = 'info') {
