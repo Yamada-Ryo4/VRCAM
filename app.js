@@ -1007,6 +1007,7 @@ async function startUpload() {
                 const rUp = await apiCall(`/api/vrc/avatars/${avatarId}`, {
                     method: 'PUT', json: {
                         assetUrl: patchedAssetUrl,
+                        assetVersion: parseInt(version2Id),
                         name,
                         imageUrl: finalImageUrl,
                         unityVersion: '2022.3.22f1',
