@@ -640,8 +640,9 @@ async function startUpload() {
                 body: sigGz,
                 headers: {
                     'X-S3-Url': sigUrl,
-                    'X-S3-Content-Type': 'application/gzip',
-                    'X-S3-Content-MD5': sigGzMd5,
+                    // content-md5 lowercase to match X-Amz-SignedHeaders value (AWS SigV4 always lowercase)
+                    'X-S3-content-md5': sigGzMd5,
+                    'X-S3-content-type': 'application/gzip',
                     'X-VRC-Auth': vrcAuth,
                 },
             });

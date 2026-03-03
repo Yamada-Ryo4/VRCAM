@@ -301,8 +301,8 @@ export default {
         }
 
         // POST /api/s3proxy — Proxy S3 uploads (bypass CORS)
-        // S3 presigned URLs use exact header matching: ONLY send headers listed in X-Amz-SignedHeaders.
-        // Sending extra headers (e.g. Content-Type when not signed) → 403 SignatureDoesNotMatch.
+        // S3 presigned URLs require EXACT header matching per X-Amz-SignedHeaders.
+        // Dynamic mapping: for each signed header h, look for X-S3-{h} in our request headers.
         if (path === "/api/s3proxy" && request.method === "PUT") {
             const s3Url = request.headers.get("X-S3-Url");
             if (!s3Url) return jsonResp({ error: "Missing X-S3-Url header" }, 400);
@@ -310,26 +310,28 @@ export default {
             // Buffer body: prevents Transfer-Encoding:chunked which S3 presigned URLs reject
             const bodyBuffer = await request.arrayBuffer();
 
-            // Parse which headers S3 expects from the presigned URL
-            let signedHeaders = [];
+            // Build headers dynamically from X-Amz-SignedHeaders in the presigned URL
+            const s3Headers = new Headers();
             try {
                 const parsedUrl = new URL(s3Url);
                 const sh = parsedUrl.searchParams.get("X-Amz-SignedHeaders");
-                if (sh) signedHeaders = sh.toLowerCase().split(";");
+                if (sh) {
+                    // X-Amz-SignedHeaders values are always lowercase (AWS SigV4 spec)
+                    const signedHeaders = sh.split(";");
+                    for (const h of signedHeaders) {
+                        if (h === "host") continue; // fetch sets Host automatically
+                        // Look for matching X-S3-{header} in our request (case-insensitive)
+                        const value = request.headers.get(`X-S3-${h}`);
+                        if (value) s3Headers.set(h, value);
+                    }
+                }
             } catch (_) { }
 
-            // Build headers: only include what X-Amz-SignedHeaders requires
-            // 'host' is handled by fetch automatically; Content-Length is never in SignedHeaders
-            const s3Headers = new Headers();
-            if (signedHeaders.includes("content-type")) {
-                const ct = request.headers.get("X-S3-Content-Type");
-                if (ct) s3Headers.set("Content-Type", ct);
+            // Extra safety: if Content-Type is in the URL query string, don't set it in headers
+            if (s3Url.includes("Content-Type=") || s3Url.includes("content-type=")) {
+                s3Headers.delete("content-type");
+                s3Headers.delete("Content-Type");
             }
-            if (signedHeaders.includes("content-md5")) {
-                const cmd5 = request.headers.get("X-S3-Content-MD5");
-                if (cmd5) s3Headers.set("Content-MD5", cmd5);
-            }
-            // Note: Content-Length is set automatically by fetch from ArrayBuffer
 
             const s3Resp = await fetch(s3Url, {
                 method: "PUT",
