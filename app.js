@@ -703,20 +703,16 @@ async function startUpload() {
         try {
             setUploadStatus(`Processing ${file.name}...`);
             let fileData = new Uint8Array(await file.arrayBuffer());
-            let avatarId = null; // Will be set for isNew mode
-            // Keep original raw data for patching later (before gzip)
-            const rawFileData = fileData;
 
-            // 1. Gzip compress the (possibly patched) file
-            setProgress(5, 'Compressing...');
-            const fileGz = await gzipCompress(fileData);
-            const fileGzMd5 = md5(fileGz);
+            // 1. Use raw file data directly (no gzip — VRChat security scanner needs raw AssetBundle)
+            const rawData = fileData;
+            const fileMd5 = md5(rawData);
+            logMsg(`File: ${rawData.length} bytes, MD5: ${fileMd5.substring(0, 16)}...`, 'info');
 
-            // 2. Compute rsync signature
+            // 2. Compute rsync signature (based on raw data)
             setProgress(10, 'Computing signature...');
-            const sigBytes = await computeRsyncSignature(fileData);
-            const sigGz = await gzipCompress(sigBytes);
-            const sigGzMd5 = md5(sigGz);
+            const sigBytes = await computeRsyncSignature(rawData);
+            const sigMd5 = md5(sigBytes);
 
             // 3. Create file & version via Worker proxy
             setProgress(15, 'Creating file version...');
@@ -737,8 +733,8 @@ async function startUpload() {
                 // Create version
                 const rVer = await apiCall(`/api/vrc/file/${fileId}`, {
                     method: 'POST', json: {
-                        signatureMd5: sigGzMd5, signatureSizeInBytes: sigGz.length,
-                        fileMd5: fileGzMd5, fileSizeInBytes: fileGz.length,
+                        signatureMd5: sigMd5, signatureSizeInBytes: sigBytes.length,
+                        fileMd5: fileMd5, fileSizeInBytes: rawData.length,
                     }
                 });
                 if (!rVer.ok) throw new Error('Failed to create version: ' + await rVer.text());
@@ -761,8 +757,8 @@ async function startUpload() {
 
                 const rVer = await apiCall(`/api/vrc/file/${fileId}`, {
                     method: 'POST', json: {
-                        signatureMd5: sigGzMd5, signatureSizeInBytes: sigGz.length,
-                        fileMd5: fileGzMd5, fileSizeInBytes: fileGz.length,
+                        signatureMd5: sigMd5, signatureSizeInBytes: sigBytes.length,
+                        fileMd5: fileMd5, fileSizeInBytes: rawData.length,
                     }
                 });
                 if (!rVer.ok) throw new Error('Failed to create version: ' + await rVer.text());
@@ -779,12 +775,11 @@ async function startUpload() {
             // Proxy S3 PUT through Worker to bypass CORS
             const rSigPut = await fetch(`${API_BASE}/api/s3proxy`, {
                 method: 'PUT',
-                body: sigGz,
+                body: sigBytes,
                 headers: {
                     'X-S3-Url': sigUrl,
-                    // content-md5 lowercase to match X-Amz-SignedHeaders value (AWS SigV4 always lowercase)
-                    'X-S3-content-md5': sigGzMd5,
-                    'X-S3-content-type': 'application/gzip',
+                    'X-S3-content-md5': sigMd5,
+                    'X-S3-content-type': 'application/x-rsync-signature',
                     'X-VRC-Auth': vrcAuth,
                 },
             });
@@ -808,12 +803,12 @@ async function startUpload() {
             // 5. Upload file (multipart, 10MB chunks) — DIRECT TO S3!
             setProgress(25, 'Uploading file...');
             const CHUNK_SIZE = 10 * 1024 * 1024;
-            const totalParts = Math.ceil(fileGz.length / CHUNK_SIZE);
+            const totalParts = Math.ceil(rawData.length / CHUNK_SIZE);
             const etags = [];
 
             for (let partNum = 1; partNum <= totalParts; partNum++) {
                 const pOffset = (partNum - 1) * CHUNK_SIZE;
-                const chunk = fileGz.subarray(pOffset, Math.min(pOffset + CHUNK_SIZE, fileGz.length));
+                const chunk = rawData.subarray(pOffset, Math.min(pOffset + CHUNK_SIZE, rawData.length));
 
                 const rPartStart = await apiCall(`/api/vrc/file/${fileId}/${versionId}/file/start?partNumber=${partNum}`, { method: 'PUT' });
                 if (!rPartStart.ok) throw new Error(`Part ${partNum} start failed: ` + await rPartStart.text());
@@ -823,7 +818,7 @@ async function startUpload() {
                 const pctBefore = 25 + ((partNum - 1) / totalParts) * 70;
                 const pctAfter = 25 + (partNum / totalParts) * 70;
                 const uploadedBefore = pOffset / 1048576;
-                const totalMB = fileGz.length / 1048576;
+                const totalMB = rawData.length / 1048576;
                 setProgress(pctBefore, `Part ${partNum}/${totalParts}: ${uploadedBefore.toFixed(1)}/${totalMB.toFixed(1)} MB`);
 
                 // Calculate Content-MD5 for this chunk (S3 requires it per X-Amz-SignedHeaders)
@@ -890,9 +885,9 @@ async function startUpload() {
             }
             if (!fileReady) throw new Error('File not ready after 5 minutes. It may still be processing — wait and try Update mode.');
 
-            // 8. Create avatar and re-upload with patched BlueprintId
+            // 8. Create avatar
             if (isNew && fileId) {
-                setProgress(96, 'Creating avatar record...');
+                setProgress(98, 'Creating avatar record...');
                 let name = uploadFiles.length === 1 ? document.getElementById('avatarName').value.trim() : '';
                 if (!name) name = file.name.replace(/\.vrca$/i, '');
 
@@ -914,7 +909,6 @@ async function startUpload() {
                 }
                 if (!finalImageUrl) finalImageUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${versionId}/file`;
 
-                // Create avatar (VRChat assigns the ID)
                 const rAvatar = await apiCall('/api/vrc/avatars', {
                     method: 'POST', json: {
                         name,
@@ -929,97 +923,7 @@ async function startUpload() {
                     }
                 });
                 if (!rAvatar.ok) throw new Error('Failed to create avatar: ' + await rAvatar.text());
-                const avatarData = await rAvatar.json();
-                avatarId = avatarData.id;
-                logMsg(`Avatar created: ${avatarId}`, 'success');
-
-                // ── Phase 2: Patch BlueprintId and re-upload as new file version ──
-                setProgress(97, 'Patching BlueprintId...');
-                const patchedData = patchBlueprintId(rawFileData, avatarId);
-
-                // Re-compress patched file
-                const patchedGz = await gzipCompress(patchedData);
-                const patchedGzMd5 = md5(patchedGz);
-                const patchedSig = await computeRsyncSignature(patchedData);
-                const patchedSigGz = await gzipCompress(patchedSig);
-                const patchedSigGzMd5 = md5(patchedSigGz);
-
-                // Create new file version
-                const rVer2 = await apiCall(`/api/vrc/file/${fileId}`, {
-                    method: 'POST', json: {
-                        signatureMd5: patchedSigGzMd5, signatureSizeInBytes: patchedSigGz.length,
-                        fileMd5: patchedGzMd5, fileSizeInBytes: patchedGz.length,
-                    }
-                });
-                if (!rVer2.ok) throw new Error('Failed to create patched version: ' + await rVer2.text());
-                const ver2Data = await rVer2.json();
-                const version2Id = ver2Data.versions[ver2Data.versions.length - 1].version;
-                logMsg(`Created patched version: ${version2Id}`, 'info');
-
-                // Upload patched signature
-                const rSig2Start = await apiCall(`/api/vrc/file/${fileId}/${version2Id}/signature/start`, { method: 'PUT' });
-                if (!rSig2Start.ok) throw new Error('Patched sig start failed: ' + await rSig2Start.text());
-                const sig2Url = (await rSig2Start.json()).url;
-                await fetch(`${API_BASE}/api/s3proxy`, {
-                    method: 'PUT', body: patchedSigGz,
-                    headers: { 'X-S3-Url': sig2Url, 'X-S3-content-md5': patchedSigGzMd5, 'X-S3-content-type': 'application/gzip', 'X-VRC-Auth': vrcAuth }
-                });
-                await apiCall(`/api/vrc/file/${fileId}/${version2Id}/signature/finish`, { method: 'PUT', json: { nextPartNumber: '0', maxParts: '0' } });
-
-                // Upload patched file (single part for simplicity since re-compress is same size)
-                setProgress(98, 'Re-uploading patched file...');
-                const CHUNK2 = 10 * 1024 * 1024;
-                const totalParts2 = Math.ceil(patchedGz.length / CHUNK2);
-                const etags2 = [];
-                for (let pn = 1; pn <= totalParts2; pn++) {
-                    const off = (pn - 1) * CHUNK2;
-                    const chunk = patchedGz.subarray(off, Math.min(off + CHUNK2, patchedGz.length));
-                    const rPS = await apiCall(`/api/vrc/file/${fileId}/${version2Id}/file/start?partNumber=${pn}`, { method: 'PUT' });
-                    if (!rPS.ok) throw new Error(`Patched part ${pn} start failed`);
-                    const pUrl = (await rPS.json()).url;
-                    const chunkMd5 = md5(chunk);
-                    const rPP = await fetch(`${API_BASE}/api/s3proxy`, {
-                        method: 'PUT', body: chunk,
-                        headers: { 'X-S3-Url': pUrl, 'X-S3-content-md5': chunkMd5, 'X-VRC-Auth': vrcAuth }
-                    });
-                    if (!rPP.ok) throw new Error(`Patched part ${pn} upload failed`);
-                    const pj = await rPP.json();
-                    if (pj.etag) etags2.push(pj.etag);
-                }
-                const finBody2 = { nextPartNumber: '0', maxParts: '0' };
-                if (totalParts2 > 1) finBody2.etags = etags2;
-                await apiCall(`/api/vrc/file/${fileId}/${version2Id}/file/finish`, { method: 'PUT', json: finBody2 });
-
-                // Wait for patched version to be ready
-                setProgress(99, 'Waiting for patched file...');
-                for (let att = 0; att < 60; att++) {
-                    await new Promise(r => setTimeout(r, 5000));
-                    const rSt = await apiCall(`/api/vrc/file/${fileId}`);
-                    if (rSt.ok) {
-                        const v = ((await rSt.json()).versions || []).find(v => v.version === parseInt(version2Id));
-                        if (v && v.status === 'complete') { logMsg('Patched version ready!', 'success'); break; }
-                        if (v && v.status === 'error') throw new Error('Patched file processing failed');
-                    }
-                }
-
-                // Update avatar assetUrl to patched version
-                const patchedAssetUrl = `https://api.vrchat.cloud/api/1/file/${fileId}/${version2Id}/file`;
-                const rUp = await apiCall(`/api/vrc/avatars/${avatarId}`, {
-                    method: 'PUT', json: {
-                        assetUrl: patchedAssetUrl,
-                        assetVersion: parseInt(version2Id),
-                        name,
-                        imageUrl: finalImageUrl,
-                        unityVersion: '2022.3.22f1',
-                        platform: 'standalonewindows',
-                    }
-                });
-                if (!rUp.ok) {
-                    const errText = await rUp.text();
-                    logMsg('assetUrl update failed: ' + errText, 'error');
-                    throw new Error('Failed to update avatar assetUrl: ' + errText);
-                }
-                logMsg(`Avatar updated to patched version ${version2Id}`, 'success');
+                logMsg(`Avatar created: ${(await rAvatar.json()).id}`, 'success');
             }
 
             setProgress(100, 'Done!');
