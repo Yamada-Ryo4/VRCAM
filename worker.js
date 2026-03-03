@@ -301,21 +301,30 @@ export default {
         }
 
         // POST /api/s3proxy — Proxy S3 uploads (bypass CORS)
-        // Body: raw file data, Headers: X-S3-Url (the pre-signed URL), optional Content-Type/Content-MD5
+        // IMPORTANT: We buffer the body to ArrayBuffer first.
+        // CF Workers streaming (ReadableStream) sends Transfer-Encoding:chunked,
+        // which S3 presigned URLs reject with 403 SignatureDoesNotMatch.
+        // Buffering → fetch uses Content-Length instead. Each chunk is ≤10MB, safe in Workers.
         if (path === "/api/s3proxy" && request.method === "PUT") {
             const s3Url = request.headers.get("X-S3-Url");
             if (!s3Url) return jsonResp({ error: "Missing X-S3-Url header" }, 400);
 
+            // Buffer the body so fetch sends Content-Length (not chunked)
+            const bodyBuffer = await request.arrayBuffer();
+
+            // Only include headers that were explicitly signed in the presigned URL
             const s3Headers = {};
             const ct = request.headers.get("X-S3-Content-Type");
             if (ct) s3Headers["Content-Type"] = ct;
             const cmd5 = request.headers.get("X-S3-Content-MD5");
             if (cmd5) s3Headers["Content-MD5"] = cmd5;
+            // Content-Length is set automatically by fetch when body is ArrayBuffer
+            s3Headers["Content-Length"] = String(bodyBuffer.byteLength);
 
             const s3Resp = await fetch(s3Url, {
                 method: "PUT",
                 headers: s3Headers,
-                body: request.body,
+                body: bodyBuffer,
             });
 
             const etag = s3Resp.headers.get("ETag") || "";
@@ -326,6 +335,7 @@ export default {
                 return jsonResp({ ok: false, status: s3Resp.status, error: errText.substring(0, 500) }, s3Resp.status);
             }
         }
+
 
         return jsonResp({ error: "Not found" }, 404);
     },
