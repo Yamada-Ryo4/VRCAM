@@ -702,34 +702,28 @@ async function startUpload() {
             if (!rFileFinish.ok) throw new Error('Failed to finalize file: ' + await rFileFinish.text());
 
             // 7. Wait for file status to become 'complete' before creating avatar
-            // Must poll GET /file/{fileId} (full file object with versions[]) not /file/{fileId}/{versionId}
+            // GET /file/{fileId}/{versionId} returns the version object directly with a `.status` field
             setProgress(97, 'Waiting for file to be processed...');
             let fileReady = false;
-            for (let attempt = 0; attempt < 30; attempt++) {
-                await new Promise(r => setTimeout(r, 3000));
-                const rStatus = await apiCall(`/api/vrc/file/${fileId}`);
+            for (let attempt = 0; attempt < 20; attempt++) {
+                await new Promise(r => setTimeout(r, 2000));
+                const rStatus = await apiCall(`/api/vrc/file/${fileId}/${versionId}`);
                 if (rStatus.ok) {
-                    const statusData = await rStatus.json();
-                    const versions = statusData.versions || [];
-                    const ver = versions.find(v => v.version === versionId) || null;
-                    if (ver) {
-                        const fileStatus = (ver.file || {}).status || 'unknown';
-                        const sigStatus = (ver.signature || {}).status || 'unknown';
-                        logMsg(`Attempt ${attempt + 1}/30 — file: ${fileStatus}, sig: ${sigStatus}`, 'info');
-                        if (fileStatus === 'complete' && sigStatus === 'complete') {
-                            fileReady = true;
-                            break;
-                        }
-                        if (fileStatus === 'error' || sigStatus === 'error') {
-                            throw new Error(`File processing failed: file=${fileStatus} sig=${sigStatus}`);
-                        }
-                    } else {
-                        logMsg(`Attempt ${attempt + 1}/30 — version ${versionId} not found yet`, 'info');
+                    const ver = await rStatus.json();
+                    const status = ver.status || 'unknown';
+                    logMsg(`Attempt ${attempt + 1}/20 — status: ${status}`, 'info');
+                    if (status === 'complete') {
+                        fileReady = true;
+                        break;
                     }
+                    if (status === 'error') {
+                        throw new Error(`File processing failed with status: error`);
+                    }
+                } else {
+                    logMsg(`Attempt ${attempt + 1}/20 — poll failed (${rStatus.status})`, 'info');
                 }
             }
-            if (!fileReady) throw new Error('Timeout: file not processed within 90s, please retry');
-
+            if (!fileReady) throw new Error('File not ready after 40s. It may still be processing — wait a moment and try the Update mode instead of New.');
 
             // 8. Create/update avatar
             if (isNew) {
